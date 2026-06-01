@@ -1,7 +1,7 @@
-"""Extractor service: извлечение текста из текста, YouTube или видео.
-
-Приоритет: готовые субтитры → аудио (Gemini) → видео (Gemini).
 """
+ExtractorService: извлечение текста из различных источников.
+"""
+
 import logging
 import os
 import re
@@ -16,189 +16,194 @@ logger = logging.getLogger(__name__)
 
 
 class ExtractorService:
-    """Извлекает текст из видео/аудио/текста."""
+    """Извлекает текст из видео, YouTube или текста."""
 
     def __init__(self):
         self.temp_dir = Settings.TEMP_DIR
         os.makedirs(self.temp_dir, exist_ok=True)
-        logger.info("[OK] ExtractorService инициализирован")
+        logger.info("[ExtractorService] Инициализирован")
 
     @staticmethod
     def _detect_language(text: str) -> str:
-        return "ru" if any("\u0400" <= c <= "\u04FF" for c in text) else "en"
+        """Определить язык."""
+        cyrillic = sum(1 for c in text if "\u0400" <= c <= "\u04FF")
+        latin = sum(1 for c in text if "a" <= c.lower() <= "z")
+        return "ru" if cyrillic > latin else "en"
 
     @staticmethod
-    def _clean_subtitle_text(content: str) -> str:
-        """Очистить VTT/SRT от меток времени и дублей."""
-        lines_out: list[str] = []
+    def _clean_subtitles(content: str) -> str:
+        """Очистить субтитры."""
+        lines = []
         prev = ""
-        for raw in content.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if (
-                line.isdigit()
-                or "-->" in line
-                or re.match(r"^\d+:\d+", line)
-            ):
+        
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.isdigit() or "-->" in line or re.match(r"^\d+:\d+", line):
                 continue
             line = re.sub(r"<[^>]+>", "", line)
-            if not line or line == prev:
-                continue
-            lines_out.append(line)
-            prev = line
-        return " ".join(lines_out)
+            if line and line != prev:
+                lines.append(line)
+                prev = line
+        
+        return " ".join(lines)
 
     def _try_subtitles(self, url: str) -> str:
-        """Скачать готовые субтитры (если есть) и вернуть очищенный текст."""
-        out_tmpl = os.path.join(self.temp_dir, "youtube_subs.%(ext)s")
+        """Загрузить субтитры."""
+        out_tmpl = os.path.join(self.temp_dir, "subs.%(ext)s")
+        
         try:
-            with yt_dlp.YoutubeDL(
-                {
-                    "skip_download": True,
-                    "writesubtitles": True,
-                    "writeautomaticsub": True,
-                    "subtitleslangs": ["ru", "en"],
-                    "outtmpl": out_tmpl,
-                    "quiet": True,
-                    "no_warnings": True,
-                }
-            ) as ydl:
+            logger.info("[ExtractorService] Загрузка субтитров...")
+            with yt_dlp.YoutubeDL({
+                "skip_download": True,
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["ru", "en"],
+                "outtmpl": out_tmpl,
+                "quiet": True,
+            }) as ydl:
                 ydl.download([url])
         except Exception as e:
-            logger.warning(f"Не удалось скачать субтитры: {e}")
+            logger.warning(f"[ExtractorService] Не удалось загрузить субтитры: {e}")
             return ""
 
         for fname in os.listdir(self.temp_dir):
-            if not fname.startswith("youtube_subs"):
-                continue
-            if not fname.endswith((".vtt", ".srt")):
-                continue
-            full = os.path.join(self.temp_dir, fname)
-            with open(full, "r", encoding="utf-8") as f:
-                text = self._clean_subtitle_text(f.read())
-            try:
-                os.remove(full)
-            except OSError:
-                pass
-            if text:
-                return text
+            if fname.startswith("subs") and fname.endswith((".vtt", ".srt")):
+                path = os.path.join(self.temp_dir, fname)
+                with open(path, "r", encoding="utf-8") as f:
+                    text = self._clean_subtitles(f.read())
+                try:
+                    os.remove(path)
+                except:
+                    pass
+                if text:
+                    logger.info(f"[ExtractorService] Субтитры загружены: {len(text)} символов")
+                    return text
+        
         return ""
 
     def _download_audio(self, url: str) -> str:
-        """Скачать аудиодорожку. Возвращает путь или ''."""
-        for ext in ("m4a", "mp3", "webm", "opus"):
-            outtmpl = os.path.join(self.temp_dir, f"youtube_audio.{ext}.%(ext)s")
+        """Загрузить аудио."""
+        for ext in ("m4a", "mp3", "webm"):
+            out_tmpl = os.path.join(self.temp_dir, f"audio.{ext}")
             try:
-                with yt_dlp.YoutubeDL(
-                    {
-                        "format": f"bestaudio[ext={ext}]/bestaudio",
-                        "outtmpl": outtmpl,
-                        "quiet": True,
-                        "no_warnings": True,
-                    }
-                ) as ydl:
+                with yt_dlp.YoutubeDL({
+                    "format": f"bestaudio[ext={ext}]/bestaudio",
+                    "outtmpl": out_tmpl,
+                    "quiet": True,
+                }) as ydl:
                     ydl.download([url])
-            except Exception:
+            except:
                 continue
+            
             for fname in os.listdir(self.temp_dir):
-                if fname.startswith("youtube_audio.") and fname.endswith(f".{ext}"):
-                    return os.path.join(self.temp_dir, fname)
+                if fname.startswith("audio.") and fname.endswith(f".{ext}"):
+                    audio_path = os.path.join(self.temp_dir, fname)
+                    logger.info(f"[ExtractorService] Аудио загружено")
+                    return audio_path
+        
         return ""
 
     def _download_video(self, url: str) -> str:
-        """Скачать видео файл (fallback). Возвращает путь или ''."""
-        out = os.path.join(self.temp_dir, "video.mp4")
+        """Загрузить видео."""
+        out_path = os.path.join(self.temp_dir, "video.mp4")
+        
         try:
-            if os.path.exists(out):
-                os.remove(out)
-            with yt_dlp.YoutubeDL(
-                {
-                    "format": "best[ext=mp4][filesize<=100M]/best[ext=mp4]/best",
-                    "outtmpl": out,
-                    "quiet": True,
-                    "no_warnings": True,
-                }
-            ) as ydl:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            
+            logger.info("[ExtractorService] Загрузка видео...")
+            with yt_dlp.YoutubeDL({
+                "format": "best[ext=mp4][filesize<=100M]/best[ext=mp4]/best",
+                "outtmpl": out_path,
+                "quiet": True,
+            }) as ydl:
                 ydl.download([url])
+            
+            if os.path.exists(out_path):
+                logger.info(f"[ExtractorService] Видео загружено")
+                return out_path
         except Exception as e:
-            logger.warning(f"Не удалось скачать видео: {e}")
-            return ""
-        return out if os.path.exists(out) else ""
+            logger.warning(f"[ExtractorService] Не удалось загрузить видео: {e}")
+        
+        return ""
 
     def _transcribe_audio(self, audio_path: str) -> Tuple[str, str]:
-        """Отправить аудио в Gemini Multimodal, вернуть (текст, язык)."""
-        logger.info("Транскрибируем аудио через Gemini...")
+        """Распознать речь в аудио."""
+        logger.info("[ExtractorService] Распознавание аудио через Gemini...")
+        
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
-        prompt = (
-            "Transcribe the speech in this audio verbatim in its original language. "
-            'At the end write a separate line: "LANGUAGE: <name>".'
-        )
+        
+        prompt = "Transcribe verbatim in original language. End with line: LANGUAGE: <name>"
         parts = [prompt, {"inline_data": {"mime_type": "audio/mp3", "data": audio_bytes}}]
         result = generate_multimodal(parts)
 
         language = "unknown"
-        m = re.search(r"LANGUAGE[=::\s]+([^\n]+)", result, re.IGNORECASE)
+        m = re.search(r"LANGUAGE[=:]\s*([^\n]+)", result, re.IGNORECASE)
         if m:
             language = m.group(1).strip()
-            result = result[: m.start()].strip()
+            result = result[:m.start()].strip()
+
         try:
             os.remove(audio_path)
-        except OSError:
+        except:
             pass
+
+        logger.info(f"[ExtractorService] Текст распознан: {len(result)} символов, язык: {language}")
         return result, language
 
     def _transcribe_video(self, video_path: str) -> Tuple[str, str]:
-        """Отправить видео в Gemini Multimodal, вернуть (текст, язык)."""
-        logger.info("Транскрибируем видео через Gemini...")
+        """Распознать речь в видео."""
+        logger.info("[ExtractorService] Распознавание видео через Gemini...")
+        
         with open(video_path, "rb") as f:
             video_bytes = f.read()
-        prompt = (
-            "Listen to this video and transcribe the speech verbatim in its original language. "
-            'After the text write two separate lines:\n"TEXT: <text>"\n"LANGUAGE: <name>"'
-        )
+        
+        prompt = "Transcribe speech verbatim. End with line: LANGUAGE: <name>"
         parts = [prompt, {"inline_data": {"mime_type": "video/mp4", "data": video_bytes}}]
         result = generate_multimodal(parts)
 
-        text = ""
+        text = result
         language = "unknown"
         for line in result.splitlines():
-            s = line.strip()
-            if s.upper().startswith("TEXT:"):
-                text = s[5:].strip()
-            elif s.upper().startswith("LANGUAGE:"):
-                language = s[8:].strip()
-        if not text:
-            text = result
+            if "LANGUAGE:" in line.upper():
+                language = line.split(":", 1)[1].strip()
+                text = result[:result.index(line)].strip()
+                break
+
+        logger.info(f"[ExtractorService] Текст распознан: {len(text)} символов, язык: {language}")
         return text, language
 
-    def _from_url(self, url: str) -> Tuple[str, str, str, str]:
-        """Обработать URL: попробовать субтитры → аудио → видео."""
-        logger.info(f"Вход: URL {url}")
-
-        subtitles = self._try_subtitles(url)
-        if subtitles:
-            return subtitles, self._detect_language(subtitles), "", ""
-
-        audio = self._download_audio(url)
-        if audio:
-            text, lang = self._transcribe_audio(audio)
-            return text, lang, "", audio
-
-        video = self._download_video(url)
-        if video:
-            text, lang = self._transcribe_video(video)
-            return text, lang, video, ""
-
-        raise RuntimeError("Не удалось извлечь текст из URL ни одним из способов")
-
-    @staticmethod
-    def _from_text(text: str) -> Tuple[str, str, str, str]:
-        return text, ExtractorService._detect_language(text), "", ""
-
     def process(self, source: str) -> Tuple[str, str, str, str]:
-        """Точка входа: текст или URL → (text, language, video_path, audio_path)."""
+        """Извлечь текст. Возвращает (text, language, video_path, audio_path)."""
+        logger.info(f"[ExtractorService] Обработка: {source[:80]}...")
+
         if source.startswith(("http://", "https://")):
-            return self._from_url(source)
-        return self._from_text(source)
+            # YouTube URL
+            subs = self._try_subtitles(source)
+            if subs:
+                lang = self._detect_language(subs)
+                return subs, lang, "", ""
+
+            audio = self._download_audio(source)
+            if audio:
+                text, lang = self._transcribe_audio(audio)
+                return text, lang, "", ""
+
+            video = self._download_video(source)
+            if video:
+                text, lang = self._transcribe_video(video)
+                return text, lang, "", ""
+
+            raise RuntimeError("Не удалось извлечь текст из URL")
+        
+        elif os.path.exists(source):
+            # Локальный файл
+            text, lang = self._transcribe_video(source)
+            return text, lang, "", ""
+        
+        else:
+            # Прямой текст
+            lang = self._detect_language(source)
+            logger.info(f"[ExtractorService] Текст: {len(source)} символов, язык: {lang}")
+            return source, lang, "", ""

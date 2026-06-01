@@ -1,145 +1,135 @@
-# FrauEdeltraud — Translation Video System
+# FrauEdeltraud - Перевод видео в английский
 
-Мультиагентная система (LangGraph) для перевода видео/текста с английскую речь
-и публикацией коротких вертикальных видео со словами и подсветкой.
+**Система для перевода русского видео/текста в простой английский (A2+) с озвучкой.**
 
-## Как это работает
+## 🚀 Быстрый старт
 
-```
-вход (текст или YouTube URL)
-        │
-        ▼
-  EXTRACTOR     ←  субтитры → Gemini audio → Gemini video
-        │
-        ▼
-  TRANSLATOR    ←  Gemini + словарь из PostgreSQL (pgvector)
-        │
-        ▼
-  VIDEO GEN     ←  edge-tts + тайминги слов + ffmpeg
-        │
-        ▼
-  TELEGRAM      ←  отправка mp4 + caption со статистикой
-```
-
-## Запуск
+### 1. Запусти тест для нужного сервиса
 
 ```bash
-# С текстом
-python main.py "Привет! Как у тебя дела?"
-
-# С YouTube URL
-python main.py "https://www.youtube.com/watch?v=..."
+python tests/test_extractor_manual.py      # Извлечение текста
+python tests/test_translator_manual.py     # Перевод
+python tests/test_critic_manual.py         # Проверка качества
+python tests/test_video_manual.py          # Генерация видео
+python tests/test_pipeline_manual.py       # Всё вместе
 ```
 
-## Структура проекта
+### 2. Отредактируй данные в тесте
 
-```
-FrauEdeltraud/
-├── main.py                          # точка входа
-├── requirements.txt                 # зависимости (librosa/soundfile удалены)
-├── pytest.ini                       # маркеры для автотестов
-├── run_tests.bat / run_tests.ps1    # скрипты запуска тестов
-│
-├── src/
-│   ├── config.py                    # настройки (TEMP_DIR, VIDEO_*, GEMINI_*)
-│   ├── langgraph_system/
-│   │   ├── state.py                 # AgentState (TypedDict)
-│   │   ├── agents.py                # 3 агента
-│   │   └── workflow.py              # граф
-│   ├── services/
-│   │   ├── extractor.py             # текст / субтитры / аудио / видео
-│   │   ├── translator.py            # Gemini + словарь
-│   │   ├── tts_service.py           # edge-tts + WordBoundary тайминги
-│   │   ├── video_service.py         # кадры PIL + ffmpeg
-│   │   ├── telegram_service.py      # отправка в Telegram
-│   │   ├── db_service.py            # PostgreSQL + pgvector
-│   │   └── llm_client.py            # Gemini → Groq fallback
-│   └── utils/logger.py
-│
-└── tests/
-    ├── conftest.py                  # фикстуры (temp_output_dir, sample_text)
-    ├── test_unit_*.py               # быстрые, без сети/БД
-    ├── test_integration_*.py        # нужны API-ключи и сеть
-    └── test_outputs/                # сюда пишутся артефакты
+Открой файл теста, найди функцию:
+
+```python
+def test_something():
+    service = SomeService()
+    
+    # РЕДАКТИРУЙ ЗДЕСЬ:
+    source = "Твой текст или URL"
+    
+    result = service.process(source)
+    print(result)
 ```
 
-## Автотесты — как запускать
-
-### Маркеры
-
-| маркер           | что делает                                                      |
-|------------------|-----------------------------------------------------------------|
-| `unit`           | чистые тесты, без сети, без БД, без API-ключей (по умолчанию)   |
-| `integration`    | нужны сеть и API-ключи в `.env`                                 |
-| `slow`           | долгие (YouTube, рендер полного видео)                          |
-| `requires_db`    | нужен PostgreSQL на `DATABASE_URL`                              |
-
-### Команды
+### 3. Запусти тест
 
 ```bash
-# ВСЕ unit-тесты — самые быстрые, не нужны ключи (~15 сек)
-python -m pytest tests/ -m unit -v
-
-# unit + integration (без slow/db) — нужны ключи и интернет (~30 сек)
-python -m pytest tests/ -m "not slow and not requires_db" -v
-
-# Только интеграция (нужны ключи)
-python -m pytest tests/ -m integration -v
-
-# Только долгие (полный workflow с рендером видео)
-python -m pytest tests/ -m slow -v
-
-# Только то, что требует БД
-python -m pytest tests/ -m requires_db -v
-
-# Всё подряд (часть упадёт без ключей/БД)
-python -m pytest tests/ -v
+python tests/test_extractor_manual.py
 ```
 
-### Скрипты
+Смотри логи от каждого сервиса в консоли.
 
-```bat
-run_tests.bat unit
-run_tests.bat "not slow and not requires_db"
-run_tests.bat slow
+## 📁 Структура тестов
+
+```
+tests/
+├── test_extractor_manual.py      - 3 теста ExtractorService
+├── test_translator_manual.py     - 3 теста TranslatorService
+├── test_critic_manual.py         - 3 теста CriticService
+├── test_video_manual.py          - 3 теста VideoGeneratorService
+└── test_pipeline_manual.py       - 3 теста всего pipeline
 ```
 
-```powershell
-.\run_tests.ps1 -Mark "unit"
-.\run_tests.ps1 -Mark "integration"
-.\run_tests.ps1                 # всё подряд
+## 🔧 Сервисы
+
+- **ExtractorService** - извлечение текста (YouTube, видео, текст)
+- **TranslatorService** - перевод на английский A2+
+- **CriticService** - проверка качества перевода
+- **VideoGeneratorService** - генерация видео с озвучкой
+
+## 📝 Примеры тестов
+
+### ExtractorService
+
+```python
+# В файле test_extractor_manual.py
+
+source = "Привет! Как дела?"  # или YouTube URL или путь к видео
+text, language, video_path, audio_path = service.process(source)
 ```
 
-### Что покрыто
+### TranslatorService
 
-| файл                              | что проверяет                                                |
-|-----------------------------------|--------------------------------------------------------------|
-| `test_unit_config.py`             | VIDEO_* кратны 16, TTS_VOICE задан, workflow компилируется    |
-| `test_unit_edge_tts_boundary.py`  | **регрессионный**: edge-tts молчит без `boundary=WordBoundary`|
-| `test_unit_tts_service.py`        | TTS возвращает непустые `word_timings` (фикс главного бага)  |
-| `test_unit_video_service.py`      | `render_frame` рисует белый текст и жёлтую подсветку         |
-| `test_unit_extractor.py`          | определение языка, очистка VTT/SRT                           |
-| `test_unit_translator.py`         | `_word_in_text` (без подстрок, регистронезависимо)           |
-| `test_integration_video.py`       | end-to-end `VideoService.process()` с ffmpeg                 |
-| `test_integration_translator.py`  | реальный перевод через LLM                                   |
-| `test_integration_db.py`          | подключение к PostgreSQL                                     |
-| `test_integration_workflow.py`    | полный E2E (text → video → telegram)                         |
-
-## Настройка окружения
-
-```env
-# .env
-GOOGLE_API_KEY=...                  # обязательно для перевода
-GROQ_API_KEY=...                    # опционально, fallback
-DATABASE_URL=postgresql://postgres:mysecretpassword@localhost:5432/postgres
-TELEGRAM_TOKEN=...
-TELEGRAM_CHAT_ID=...
+```python
+source = "Привет! Как дела?"
+translated, stats = service.process(source)
 ```
 
-Системные зависимости: **ffmpeg** (для склейки видео и аудио; imageio-ffmpeg как fallback), **PostgreSQL + pgvector** (для словаря).
+### CriticService
 
-## Частые ошибки
+```python
+source = "Привет! Как дела?"
+translation = "Hello! How are you?"
+is_approved, final, details = service.critique(source, translation, stats)
+```
 
-- **«ffmpeg не найден»** — установите ffmpeg или используется imageio-ffmpeg fallback
-- **«429 Quota exceeded»** — дневная квота Gemini; подождите или настройте GROQ_API_KEY
-- **«Видео без субтитров»** — этот баг исправлен (см. commit history). Регрессионный тест: `pytest tests/test_unit_edge_tts_boundary.py -v`
+### VideoGeneratorService
+
+```python
+text = "Hello! How are you?"
+video_path, duration = service.process(text)
+```
+
+## 💬 Логирование
+
+Каждый сервис выводит логи с префиксом:
+
+```
+[ExtractorService] Инициализирован
+[ExtractorService] Обработка: Привет ...
+✓ Извлечено (ru): 50 символов
+
+[TranslatorService] Инициализирован
+[TranslatorService] Начало перевода...
+✓ Перевод завершён: 70 символов
+
+[CriticService] Проверка перевода...
+✓ Оценка: 8/10, Одобрено: True
+
+[VideoGeneratorService] Генерация видео...
+✓ Видео готово: 5.2 сек
+```
+
+## 🎯 Как работает
+
+1. Открываешь файл теста
+2. Редактируешь входные данные (текст, URL или путь к видео)
+3. Запускаешь: `python tests/test_*.py`
+4. Смотришь логи в консоли
+5. Результат в `./temp/` папке
+
+**Всё просто и ручное. Никаких автотестов.**
+
+## 📋 Требования
+
+```bash
+pip install -r requirements.txt
+```
+
+Нужен `.env` файл с `GOOGLE_API_KEY`.
+
+## ✅ Что было
+
+- ✓ 5 ручных тестов для каждого сервиса
+- ✓ Каждый тест - это Python файл который ты редактируешь
+- ✓ Логи от каждого сервиса отдельно
+- ✓ Никаких автотестов
+- ✓ Чистый и простой код

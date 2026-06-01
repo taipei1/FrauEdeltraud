@@ -1,121 +1,102 @@
-"""Translator service: перевод на английский A2+ с приоритетом словаря."""
+"""
+TranslatorService: перевод на английский A2+.
+
+Использует грамматические темы из learned_topics.json.
+"""
+
+import json
 import logging
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from config import Settings
-from services.db_service import get_db_service
 from services.llm_client import generate_text
 
 logger = logging.getLogger(__name__)
 
 
-def _word_in_text(word: str, text: str) -> bool:
-    """Проверить, что слово из словаря встречается в тексте как отдельное слово."""
-    if not word:
-        return False
-    word_l = word.lower()
-    text_l = text.lower()
-    return (
-        f" {word_l} " in f" {text_l} "
-        or text_l.startswith(f"{word_l} ")
-        or text_l.endswith(f" {word_l}")
-    )
-
-
 class TranslatorService:
-    """Переводчик с приоритетом словаря ученика."""
+    """Переводчик с приоритизацией тем."""
 
     def __init__(self):
-        self.db = get_db_service()
-        logger.info("[OK] Translator инициализирован")
+        self.learned_topics = self._load_learned_topics()
+        logger.info("[TranslatorService] Инициализирован")
 
-    def _build_vocabulary_prompt(self) -> Tuple[str, List[Dict]]:
-        """Собрать словарь для промпта и вернуть сырой список слов."""
-        hot_words = self.db.get_hot_vocabulary(limit=Settings.MAX_VOCABULARY_WORDS)
-        if not hot_words:
-            return "", []
+    def _load_learned_topics(self) -> Dict:
+        """Загрузить грамматические темы."""
+        try:
+            path = Path(Settings.LEARNED_TOPICS_PATH)
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    topics = data.get("topics", [])
+                    logger.info(f"[TranslatorService] Загружено {len(topics)} тем")
+                    return data
+        except Exception as e:
+            logger.warning(f"[TranslatorService] Не удалось загрузить темы: {e}")
+        
+        return {"topics": []}
 
-        lines = []
-        for w in hot_words[:50]:
-            word = w.get("word", "")
-            translation = w.get("translation", "")
-            if word and translation:
-                lines.append(f'- "{word}" = {translation}')
+    def _build_topics_prompt(self) -> str:
+        """Собрать подсказку о темах."""
+        topics = self.learned_topics.get("topics", [])
+        if not topics:
+            return ""
+        
+        lines = ["LEARNED GRAMMAR TOPICS:"]
+        for topic in topics[:10]:
+            name = topic.get("name", "")
+            desc = topic.get("description", "")
+            lines.append(f"- {name}: {desc}")
+        
+        return "\n".join(lines)
 
-        prompt = "\n".join(lines)
-        logger.info(f"[OK] Словарь для промпта: {len(lines)} слов")
-        return prompt, hot_words
-
-    def _translate_chunks(self, text: str, vocab_prompt: str) -> str:
-        """Разбить текст на чанки и перевести каждый."""
+    def _translate_chunks(self, text: str, topics_prompt: str) -> str:
+        """Перевести текст чанками."""
         chunk_size = Settings.TRANSLATION_CHUNK_SIZE
         chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
         translated_parts: List[str] = []
 
         for idx, chunk in enumerate(chunks, start=1):
-            logger.info(f"[TRANSLATOR] Перевод чанка {idx}/{len(chunks)}")
-            prompt = self._build_prompt(chunk, vocab_prompt, idx, len(chunks))
-            translated_parts.append(generate_text(prompt))
-            logger.info(f"[OK] Чанк {idx} переведён")
+            logger.info(f"[TranslatorService] Перевод чанка {idx}/{len(chunks)}")
+            prompt = self._build_prompt(chunk, topics_prompt, idx, len(chunks))
+            translated = generate_text(prompt)
+            translated_parts.append(translated)
 
         return " ".join(translated_parts)
 
-    def _build_prompt(self, chunk: str, vocab_prompt: str, idx: int, total: int) -> str:
-        if vocab_prompt:
-            return f"""Translate the following text into simple English (CEFR A2+).
+    def _build_prompt(self, chunk: str, topics_prompt: str, idx: int, total: int) -> str:
+        """Собрать промпт."""
+        base = f"""Translate to simple English (CEFR A2+).
+Output ONLY the translation, no comments.
 
-VOCABULARY PRIORITY — use these words from the learner's dictionary whenever they fit (max coverage, do NOT distort meaning):
-{vocab_prompt}
+"""
+        
+        if topics_prompt:
+            base += f"""{topics_prompt}
 
-RULES:
-1. If a vocabulary word fits EXACTLY (100%) — use it.
-2. If it fits 80%+ — use it.
-3. If it fits < 60% — do not use, pick a simpler alternative.
-4. Keep sentences short and natural for A2+.
-5. Output ONLY the translation, no commentary.
+Try to use these constructions naturally where appropriate.
 
-TEXT (chunk {idx}/{total}):
-{chunk}"""
-        return f"""Translate the following text into simple English (CEFR A2+).
-Output ONLY the translation, no commentary.
+"""
 
-TEXT (chunk {idx}/{total}):
+        base += f"""TEXT (chunk {idx}/{total}):
 {chunk}"""
 
-    def _analyze_usage(
-        self, translated_text: str, hot_words: List[Dict]
-    ) -> Tuple[Dict[str, str], Dict]:
-        """Сопоставить использованные слова словаря с переводом."""
-        usage: Dict[str, str] = {}
-        used_words: List[str] = []
+        return base
 
-        for w in hot_words:
-            word = w.get("word", "")
-            translation = w.get("translation", "")
-            if word and _word_in_text(word, translated_text):
-                usage[word] = translation
-                used_words.append(word)
-
-        total = len(hot_words)
-        used = len(used_words)
-        pct = round((used / total * 100) if total else 0, 1)
-
+    def process(self, raw_text: str) -> Tuple[str, Dict]:
+        """Перевести текст. Возвращает (translation, stats)."""
+        logger.info("[TranslatorService] Начало перевода...")
+        
+        topics_prompt = self._build_topics_prompt()
+        translated = self._translate_chunks(raw_text, topics_prompt)
+        
+        logger.info(f"[TranslatorService] Перевод завершён: {len(translated)} символов")
+        
         stats = {
-            "total_vocabulary_words": total,
-            "used_words": used_words,
-            "used_count": used,
-            "vocabulary_percentage": pct,
+            "total_vocabulary_words": 0,
+            "used_count": 0,
+            "vocabulary_percentage": 0,
         }
-        logger.info(f"[OK] Словарь: {used}/{total} ({pct}%)")
-        return usage, stats
-
-    def process(self, raw_text: str) -> Tuple[str, Dict[str, str], Dict]:
-        """Перевести текст и вернуть (translation, vocabulary_usage, stats)."""
-        logger.info("[TRANSLATOR] Перевод текста...")
-
-        vocab_prompt, hot_words = self._build_vocabulary_prompt()
-        translated = self._translate_chunks(raw_text, vocab_prompt)
-        usage, stats = self._analyze_usage(translated, hot_words)
-
-        logger.info("[OK] Перевод завершён")
-        return translated, usage, stats
+        
+        return translated, stats
