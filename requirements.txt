@@ -1,0 +1,17 @@
+langchain
+langchain-google-genai
+langgraph
+python-dotenv
+psycopg2-binary
+pgvector
+pydantic
+edge-tts
+python-telegram-bot
+google-generativeai
+httpx
+requests
+numpy
+pillow
+imageio
+imageio-ffmpeg
+yt-dlp
