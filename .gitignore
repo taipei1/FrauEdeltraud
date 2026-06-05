@@ -48,3 +48,7 @@ temp/
 
 # Secrets
 .env
+
+# Temporary files
+tmp/
+results/
