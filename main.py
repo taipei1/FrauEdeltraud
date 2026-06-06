@@ -20,6 +20,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+# Pre-load the embedding model at startup (avoids 30s delay on first request)
+from services.embeddings import initialize as init_embeddings
+init_embeddings()
+
 from services.bot import start_telegram_bot
 
 def main() -> int:

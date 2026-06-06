@@ -61,7 +61,11 @@ def _get_vocab_tokens() -> set[str]:
     return _vocab_tokens
 
 
+def _strip_markdown(text: str) -> str:
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+
 def _highlight_vocab(text: str) -> str:
+    text = _strip_markdown(text)
     tokens = _get_vocab_tokens()
     if not tokens:
         return text
