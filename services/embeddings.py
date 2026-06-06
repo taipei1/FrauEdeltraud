@@ -1,19 +1,8 @@
-"""
-embeddings.py — Embedding provider abstraction.
-
-Two backends:
-  - LocalSentenceTransformers (default): offline, no API cost, 384-dim
-  - GeminiEmbeddings: online via Google Gemini, 3072-dim, requires GOOGLE_API_KEY
-
-Select via env var EMBEDDING_BACKEND=local|gemini (default: local).
-Caches embeddings on disk keyed by text content.
-"""
 import os
 import hashlib
 import logging
 import pickle
 import time
-import warnings
 from pathlib import Path
 from typing import Sequence
 
@@ -24,11 +13,14 @@ log = logging.getLogger("embeddings")
 CACHE_DIR = Path(os.getenv("EMBEDDINGS_CACHE_DIR", "cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-BACKEND = os.getenv("EMBEDDING_BACKEND", "local").lower()
-LOCAL_MODEL_NAME = os.getenv("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-GEMINI_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+BACKEND = os.getenv("EMBEDDING_BACKEND", "gemini").lower()
+_LOCAL_MODEL_NAME = os.getenv("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+_GEMINI_MODEL = os.getenv(
+    "GEMINI_EMBEDDING_MODEL",
+    "models/gemini-embedding-001",
+)
+_EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
 
-# Lazy-loaded singletons
 _local_model = None
 _gemini_client = None
 _active_backend: str | None = None
@@ -64,9 +56,9 @@ def _get_local():
     global _local_model, _active_dim
     if _local_model is None:
         from sentence_transformers import SentenceTransformer
-        log.info("Loading local model: %s", LOCAL_MODEL_NAME)
-        _local_model = SentenceTransformer(LOCAL_MODEL_NAME)
-        _active_dim = int(_local_model.get_sentence_embedding_dimension())
+        log.info("Loading local model: %s", _LOCAL_MODEL_NAME)
+        _local_model = SentenceTransformer(_LOCAL_MODEL_NAME)
+        _active_dim = int(_local_model.get_embedding_dimension())
         log.info("Local model loaded, dim=%d", _active_dim)
     return _local_model
 
@@ -74,30 +66,31 @@ def _get_local():
 def _get_gemini():
     global _gemini_client, _active_dim
     if _gemini_client is None:
-        warnings.filterwarnings("ignore")
-        import google.generativeai as genai
+        from google import genai
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY is not set")
-        genai.configure(api_key=api_key)
-        _gemini_client = genai
-        _active_dim = 3072
-        log.info("Gemini client configured, dim=%d", _active_dim)
+        _gemini_client = genai.Client(api_key=api_key)
+        _active_dim = _EMBEDDING_DIM
+        log.info("Gemini client ready, model=%s, dim=%d", _GEMINI_MODEL, _active_dim)
     return _gemini_client
 
 
 def initialize() -> tuple[str, int]:
-    """Pick backend based on env, return (backend_name, dim)."""
     global _active_backend, _active_dim
     if BACKEND == "gemini":
         try:
             _get_gemini()
             _active_backend = "gemini"
         except Exception as e:
-            log.warning("Gemini backend init failed (%s), falling back to local", e)
+            log.warning("Gemini init failed (%s), falling back to local", e)
             _get_local()
             _active_backend = "local"
+    elif BACKEND == "local":
+        _get_local()
+        _active_backend = "local"
     else:
+        log.warning("Unknown backend=%s, falling back to local", BACKEND)
         _get_local()
         _active_backend = "local"
     return _active_backend, _active_dim or 0
@@ -124,13 +117,17 @@ def _embed_local(text: str) -> np.ndarray:
 
 
 def _embed_gemini(text: str) -> np.ndarray:
-    genai = _get_gemini()
-    result = genai.embed_content(model=GEMINI_MODEL, content=text)
-    return np.asarray(result["embedding"], dtype=np.float32)
+    client = _get_gemini()
+    from google.genai import types
+    result = client.models.embed_content(
+        model=_GEMINI_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=_active_dim),
+    )
+    return np.asarray(result.embeddings[0].values, dtype=np.float32)
 
 
 def embed(text: str, use_cache: bool = True) -> np.ndarray:
-    """Embed a single text. Returns 1D numpy array."""
     text = (text or "").strip()
     if not text:
         return np.zeros(active_dim(), dtype=np.float32)
@@ -153,7 +150,6 @@ def embed(text: str, use_cache: bool = True) -> np.ndarray:
 
 
 def embed_batch(texts: Sequence[str], use_cache: bool = True) -> np.ndarray:
-    """Embed a list of texts. Returns (N, dim) matrix."""
     backend = active_backend()
     cleaned = [(t or "").strip() for t in texts]
     dim = active_dim()
@@ -172,23 +168,42 @@ def embed_batch(texts: Sequence[str], use_cache: bool = True) -> np.ndarray:
         todo_idx.append(i)
         todo_texts.append(t)
 
-    log.info("Embedding %d/%d new texts via %s (rest cached)",
+    if not todo_texts:
+        return np.vstack(vectors)
+
+    log.info("Embedding %d/%d texts via %s (rest cached)",
              len(todo_texts), len(cleaned), backend)
 
     if backend == "gemini":
+        client = _get_gemini()
+        from google.genai import types
         BATCH = 50
         for start in range(0, len(todo_texts), BATCH):
-            batch_texts = todo_texts[start:start + BATCH]
-            batch_idx = todo_idx[start:start + BATCH]
-            for j, t in enumerate(batch_texts):
-                try:
-                    vectors[batch_idx[j]] = _embed_gemini(t)
+            batch = todo_texts[start:start + BATCH]
+            idx = todo_idx[start:start + BATCH]
+            try:
+                result = client.models.embed_content(
+                    model=_GEMINI_MODEL,
+                    contents=batch,
+                    config=types.EmbedContentConfig(output_dimensionality=dim),
+                )
+                for j, emb in enumerate(result.embeddings):
+                    v = np.asarray(emb.values, dtype=np.float32)
+                    vectors[idx[j]] = v
                     if use_cache:
-                        _save_cache(t, vectors[batch_idx[j]].tolist())
-                except Exception as e:
-                    log.warning("Batch embed failed for %r: %s", t[:40], e)
+                        _save_cache(batch[j], v.tolist())
+            except Exception as e:
+                log.warning("Gemini batch failed: %s, embedding one-by-one", e)
+                for j, t in enumerate(batch):
+                    try:
+                        vec = _embed_gemini(t)
+                        vectors[idx[j]] = vec
+                        if use_cache:
+                            _save_cache(t, vec.tolist())
+                    except Exception as e2:
+                        log.warning("Embed failed %r: %s", t[:40], e2)
             if start + BATCH < len(todo_texts):
-                time.sleep(0.5)
+                time.sleep(0.3)
     else:
         if todo_texts:
             model = _get_local()
@@ -208,16 +223,8 @@ def embed_batch(texts: Sequence[str], use_cache: bool = True) -> np.ndarray:
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Cosine similarity between rows of a (N, D) and rows of b (M, D).
-    Returns (N, M) matrix.
-    """
     a_norm = np.linalg.norm(a, axis=1, keepdims=True) + 1e-10
     b_norm = np.linalg.norm(b, axis=1, keepdims=True) + 1e-10
     a_n = a / a_norm
     b_n = b / b_norm
     return a_n @ b_n.T
-
-
-# Backwards-compatible alias (used by older imports)
-GeminiEmbeddings = None  # type: ignore
-EMBEDDING_DIM = None  # set after initialize()

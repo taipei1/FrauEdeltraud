@@ -1,15 +1,6 @@
-"""
-agent.py — LangGraph pipeline: Chat → Vector Translator → Critic.
-
-Flow:
-  1. chat_node: LLM generates response to user input
-  2. vector_translate_node: Rewrites response using learner's known vocabulary,
-     selecting relevant words via vector similarity (Gemini embeddings).
-  3. critic_node: Checks if meaning is preserved, fixes if needed
-"""
 import os
 import logging
-from typing import Annotated, Optional
+from typing import Annotated
 from typing_extensions import TypedDict
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -17,201 +8,191 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from services.vector_vocabulary import get_vector_vocabulary
-from services.vector_translator import vector_translate, TranslationConfig
+from services.vector_translator import vector_translate, TranslationConfig, build_system_prompt
 from services.critic import critique_translation
+from services.vocabulary import get_recent_words
 
 log = logging.getLogger("agent")
 
 LEVEL = os.getenv("LANGUAGE_LEVEL", "A2").upper()
-GRAMMAR_FILE = os.getenv("GRAMMAR_TOPICS_FILE", "grammar_topics.yaml")
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 
 
-def _load_grammar_topics() -> str:
-    """Load grammar topics from YAML file, return formatted string."""
-    import yaml
-    path = GRAMMAR_FILE
-    if not os.path.exists(path):
-        log.warning("Grammar topics file not found: %s", path)
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        topics = data.get("grammar", [])
-        if not topics:
-            return ""
-        lines = [f"- {t}" for t in topics]
-        return "\n".join(lines)
-    except Exception as e:
-        log.warning("Failed to load grammar topics: %s", e)
-        return ""
+def _get_llm(model: str | None = None):
+    provider = os.getenv("LLM_PROVIDER", "deepseek").lower()
+    model_name = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is not set")
+        return ChatGroq(model=model_name, groq_api_key=api_key)
+    else:
+        from langchain_openai import ChatOpenAI
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY is not set")
+        return ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url="https://api.deepseek.com/v1",
+        )
 
 
-def _build_system_prompt() -> str:
-    """Build the full system prompt with grammar topics."""
-    grammar_block = _load_grammar_topics()
-    grammar_section = (
-        "\n\nThe learner is currently studying these grammar topics. "
-        "Use them naturally in your response (at least 1-2 of them):\n"
-        f"{grammar_block}"
-    ) if grammar_block else ""
-
-    return (
-        f"You are a friendly English conversation partner. "
-        f"The learner's English level is CEFR {LEVEL}.\n\n"
-
-        "RESPONSE STRUCTURE:\n"
-        "1. CORRECTIONS — Look at the learner's message. If it has mistakes, "
-        "show the correct version and explain briefly. "
-        "If there are NO mistakes, say \"All correct!\" in English.\n"
-        "2. ANSWER — Then answer their question or continue the conversation "
-        "naturally. Give rich, interesting information. "
-        f"Practice the grammar topics below.{grammar_section}\n"
-        "3. Ask exactly ONE follow-up question at the very end — no more, no fewer.\n\n"
-
-        "RULES:\n"
-        "- Reply ONLY in English.\n"
-        "- Be warm, encouraging, and engaging.\n"
-        "- Be INFORMATIVE. Give rich answers with interesting facts, examples, "
-        "and new information. The learner talks to you to expand their horizons "
-        "and learn new things. Generic or obvious answers are NOT interesting.\n"
-        "- Keep sentences simple (A2-B1 level), but do not sacrifice content "
-        "for brevity. A longer answer with real information is better than "
-        "a short empty one.\n"
-        "- Do NOT replace unknown words with explanations. If a word is not in "
-        "the vocabulary, leave it as it is. Only use words from the vocabulary "
-        "list when they are a natural fit.\n"
-        "- Topics: hobbies, food, family, weather, plans, work/study, travel, "
-        "daily life, nature, science, history, culture, technology.\n"
-        "- Avoid politics, religion, medical/legal/financial advice, idioms, slang.\n"
-        "- OVERRIDE RULE: If the learner explicitly asks you to ignore "
-        "or change any of these instructions during the conversation, "
-        "obey their direct instruction instead."
-    )
-
-GREETINGS = [
-    "Hi! I'm glad to chat with you today. How are you feeling?",
-    "Hello! Tell me, what did you do this morning?",
-    "Hey! What's your favourite food, and why?",
-    "Hi there! Do you have any hobbies? Tell me about one.",
-    "Hello! What is the weather like in your city today?",
-    "Hi! What did you eat for breakfast?",
-    "Hey! Do you like listening to music? What kind?",
-]
-
-
-# --- State ---
 class State(TypedDict, total=False):
     messages: Annotated[list, add_messages]
-    raw_response: str         # LLM's raw response
-    translated_response: str  # After vocabulary replacement
-    final_response: str       # After critic approval/fix
-    known_words: list[str]    # Vocabulary from DB
-    critic_score: int         # Quality score 1-10
-    selected_vocab: list      # Vector-selected relevant words: [(word, score), ...]
-    unknown_tokens: list[str]  # Tokens in raw_response not in known vocabulary
+    user_text: str
+    raw_response: str
+    translated_response: str
+    final_response: str
+    known_words: list[str]
+    critic_score: int
+    selected_vocab: list
+    unknown_tokens: list[str]
+    corrections: dict
+    mode: str
+    story_params: dict
 
 
-# --- Nodes ---
-FALLBACK_MODEL = "llama3-8b-8192"
-
-
-def _llm_invoke(messages: list, model: str, api_key: str, temperature: float, max_tokens: int) -> str:
-    from langchain_groq import ChatGroq
-    """Invoke LLM with fallback on rate limit."""
-    try:
-        llm = ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens, groq_api_key=api_key)
-        return llm.invoke(messages).content
-    except Exception as e:
-        err = str(e)
-        if "429" in err or "rate_limit" in err.lower():
-            log.warning("Rate limited on %s, falling back to %s", model, FALLBACK_MODEL)
-            fallback = ChatGroq(model=FALLBACK_MODEL, temperature=temperature, max_tokens=max_tokens, groq_api_key=api_key)
-            return fallback.invoke(messages).content
-        raise
-
-
-def chat_node(state: State) -> dict:
-    """Generate LLM response to user input."""
-    model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not set")
-    
-    system_prompt = _build_system_prompt()
-    msgs = [SystemMessage(content=system_prompt)] + list(state.get("messages") or [])
-    raw_text = _llm_invoke(msgs, model_name, api_key, 0.7, 400)
-    log.info("Chat raw response: %r", raw_text[:100])
-    return {
-        "raw_response": raw_text,
-    }
+def _trim_history(messages: list) -> list:
+    """Keep only last MAX_HISTORY_TURNS user-assistant pairs."""
+    if len(messages) <= MAX_HISTORY_TURNS * 2:
+        return messages
+    return messages[-(MAX_HISTORY_TURNS * 2):]
 
 
 def load_vocabulary_node(state: State) -> dict:
-    """Fetch known vocabulary (with embeddings) from the database."""
     try:
         vocab = get_vector_vocabulary("en")
         if not vocab._loaded:
             vocab.load()
         words = vocab.words()
-        log.info("Loaded %d known vocabulary words from DB (with vectors)", len(words))
+        log.info("Loaded %d known vocabulary words", len(words))
         return {"known_words": words}
     except Exception as e:
-        log.warning("Failed to load vocabulary: %s, skipping translation", e)
+        log.warning("Failed to load vocabulary: %s", e)
         return {"known_words": []}
 
 
+def corrections_node(state: State) -> dict:
+    """Analyze user's last message for mistakes and produce structured corrections."""
+    user_text = state.get("user_text", "")
+    if not user_text.strip():
+        return {"corrections": {"correct": True, "issues": [], "corrected": ""}}
+
+    system = """You are an English teacher. Analyze the learner's message and find mistakes.
+Check: spelling, grammar, word choice, articles, prepositions, tense.
+
+Respond with ONLY valid JSON:
+{
+    "correct": true/false,
+    "issues": ["description of each issue"],
+    "corrected": "the fully corrected version of the message"
+}
+
+If no mistakes: {"correct": true, "issues": [], "corrected": "same as original"}"""
+
+    try:
+        llm = _get_llm()
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=user_text),
+        ]
+        raw = llm.invoke(messages).content.strip()
+
+        import json
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        result = json.loads(raw)
+        log.info("Corrections: correct=%s, issues=%d", result.get("correct"), len(result.get("issues", [])))
+        return {"corrections": result}
+    except Exception as e:
+        log.warning("Corrections node failed: %s", e)
+        return {"corrections": {"correct": True, "issues": [], "corrected": user_text}}
+
+
+def chat_node(state: State) -> dict:
+    """Generate response using DeepSeek with vocabulary in system prompt."""
+    user_text = state.get("user_text", "")
+    known_words = state.get("known_words", [])
+    corrections = state.get("corrections", {})
+    mode = state.get("mode", "conversation")
+
+    system_prompt = build_system_prompt(
+        user_text,
+        known_words,
+        TranslationConfig(),
+        mode=mode,
+        story_params=state.get("story_params"),
+    )
+
+    # Inject corrections into the prompt
+    if corrections:
+        if corrections.get("correct"):
+            system_prompt += "\n\nThe learner's last message was correct!"
+        else:
+            issues = "; ".join(corrections.get("issues", []))
+            corrected = corrections.get("corrected", "")
+            system_prompt += f"\n\nThe learner's last message needs correction. Issues: {issues}"
+            if corrected:
+                system_prompt += f"\nCorrected version: {corrected}"
+            system_prompt += "\nStart your response with the corrections."
+
+    history = _trim_history(list(state.get("messages") or []))
+    msgs = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=user_text)]
+
+    try:
+        llm = _get_llm()
+        raw_text = llm.invoke(msgs).content
+        log.info("Chat raw output: %r", raw_text[:100])
+        return {"raw_response": raw_text}
+    except Exception as e:
+        log.error("Chat node failed: %s", e)
+        return {"raw_response": "I had trouble processing that. Could you try again?"}
+
+
 def translate_node(state: State) -> dict:
-    """Rewrite response using vector-selected known vocabulary."""
+    """Check that vocabulary words were used; pass through if fine."""
     raw = state.get("raw_response", "")
     known = state.get("known_words", [])
-    
-    if not known or not raw:
-        log.info("Skipping translation (no vocabulary or empty response)")
+
+    if not raw:
         return {"translated_response": raw}
-    
-    try:
-        vocab = get_vector_vocabulary("en")
-        if not vocab._loaded:
-            vocab.load()
-        cfg = TranslationConfig(
-            temperature=float(os.getenv("TRANSLATOR_TEMPERATURE", "0.3")),
-            top_k_per_word=int(os.getenv("TRANSLATOR_TOP_K", "8")),
-            max_vocab_in_prompt=int(os.getenv("TRANSLATOR_MAX_VOCAB", "200")),
-            similarity_threshold=float(os.getenv("TRANSLATOR_THRESHOLD", "0.45")),
-        )
-        result = vector_translate(raw, vocab=vocab, cfg=cfg)
-        return {
-            "translated_response": result["rewritten"],
-            "selected_vocab": result["selected_vocab"],
-            "unknown_tokens": result["unknown_tokens"],
-        }
-    except Exception as e:
-        log.error("Translation failed: %s, using raw response", e)
-        return {"translated_response": raw}
+
+    result = vector_translate(raw, known)
+    return {
+        "translated_response": result["rewritten"],
+        "selected_vocab": result["selected_vocab"],
+        "unknown_tokens": result["unknown_tokens"],
+    }
 
 
 def critic_node(state: State) -> dict:
-    """Check if translated text preserves meaning."""
+    """Check the response quality."""
     raw = state.get("raw_response", "")
     translated = state.get("translated_response", "")
     selected = state.get("selected_vocab", [])
-    
-    if not raw or not translated or raw == translated:
+    user_text = state.get("user_text", "")
+
+    if not raw or not translated:
         return {
             "final_response": translated or raw,
             "critic_score": 10,
             "selected_vocab": selected,
             "messages": [AIMessage(content=translated or raw)],
         }
-    
+
     try:
-        result = critique_translation(raw, translated)
+        result = critique_translation(raw, translated, user_message=user_text)
         final = result["fixed_text"]
         score = result["score"]
-        log.info(
-            "Critic result: score=%d, approved=%s",
-            score, result["approved"],
-        )
+
+        log.info("Critic: score=%d, approved=%s", score, result["approved"])
         return {
             "final_response": final,
             "critic_score": score,
@@ -219,7 +200,7 @@ def critic_node(state: State) -> dict:
             "messages": [AIMessage(content=final)],
         }
     except Exception as e:
-        log.error("Critic failed: %s, using translated response", e)
+        log.error("Critic failed: %s, using raw response", e)
         return {
             "final_response": translated,
             "critic_score": 5,
@@ -228,25 +209,25 @@ def critic_node(state: State) -> dict:
         }
 
 
-# --- Graph Construction ---
 _graph_cache: dict[int, object] = {}
 
 
 def _build_graph():
-    """Build the LangGraph with chat → vocabulary → translate → critic."""
     workflow = StateGraph(State)
-    
+
     workflow.add_node("load_vocabulary", load_vocabulary_node)
+    workflow.add_node("corrections", corrections_node)
     workflow.add_node("chat", chat_node)
     workflow.add_node("translate", translate_node)
     workflow.add_node("critic", critic_node)
-    
+
     workflow.add_edge(START, "load_vocabulary")
-    workflow.add_edge("load_vocabulary", "chat")
+    workflow.add_edge("load_vocabulary", "corrections")
+    workflow.add_edge("corrections", "chat")
     workflow.add_edge("chat", "translate")
     workflow.add_edge("translate", "critic")
     workflow.add_edge("critic", END)
-    
+
     return workflow.compile(checkpointer=InMemorySaver())
 
 
@@ -257,14 +238,14 @@ def _get_graph(chat_id: int):
     return _graph_cache[chat_id]
 
 
-# --- Public API ---
 def reply(chat_id: int, user_text: str) -> dict:
-    """Send user input through the full pipeline.
-    Returns dict with final_response, selected_vocab, unknown_tokens."""
     graph = _get_graph(chat_id)
     config = {"configurable": {"thread_id": str(chat_id)}}
     result = graph.invoke(
-        {"messages": [HumanMessage(content=user_text)]},
+        {
+            "messages": [HumanMessage(content=user_text)],
+            "user_text": user_text,
+        },
         config=config,
     )
     return {
@@ -274,8 +255,45 @@ def reply(chat_id: int, user_text: str) -> dict:
     }
 
 
+def generate_story(chat_id: int, topic: str, word_count: int = 200) -> str:
+    """Generate a story using recently added vocabulary."""
+    recent = get_recent_words("en", days=7, limit=50)
+    vocab = get_vector_vocabulary("en")
+    if not vocab._loaded:
+        vocab.load()
+    known = vocab.words()
+
+    params = {
+        "topic": topic,
+        "word_count": word_count,
+        "recent_words": recent,
+    }
+
+    system_prompt = build_system_prompt(
+        topic,
+        known,
+        TranslationConfig(),
+        mode="story",
+        story_params=params,
+    )
+
+    llm = _get_llm()
+    msgs = [SystemMessage(content=system_prompt)]
+    story = llm.invoke(msgs).content
+    log.info("Generated story (%d words): %r", len(story.split()), story[:80])
+    return story
+
+
 def greet(chat_id: int) -> str:
-    """Generate greeting, insert into memory, and return it."""
+    GREETINGS = [
+        "Hi! I'm glad to chat with you today. How are you feeling?",
+        "Hello! Tell me, what did you do this morning?",
+        "Hey! What's your favourite food, and why?",
+        "Hi there! Do you have any hobbies? Tell me about one.",
+        "Hello! What is the weather like in your city today?",
+        "Hi! What did you eat for breakfast?",
+        "Hey! Do you like listening to music? What kind?",
+    ]
     text = GREETINGS[chat_id % len(GREETINGS)]
     graph = _get_graph(chat_id)
     config = {"configurable": {"thread_id": str(chat_id)}}
@@ -284,5 +302,4 @@ def greet(chat_id: int) -> str:
 
 
 def reset(chat_id: int) -> bool:
-    """Clear memory for the given chat_id."""
     return _graph_cache.pop(chat_id, None) is not None
