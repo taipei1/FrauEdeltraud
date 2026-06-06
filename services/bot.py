@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import tempfile
 import logging
@@ -19,8 +20,68 @@ ALLOWED_CHAT_IDS = {
     int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip().isdigit()
 }
 
+_VOCAB_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*")
+_vocab_tokens: set[str] | None = None
+
+# Common function words to exclude from highlighting (too frequent, not meaningful)
+_EXCLUDED_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "my", "your", "his", "its", "our", "their",
+    "this", "that", "these", "those",
+    "and", "or", "but", "not", "no", "yes",
+    "if", "when", "then", "so", "because", "also", "too",
+    "to", "in", "on", "at", "for", "with", "from", "by", "of", "about",
+    "up", "down", "out", "off", "over", "under",
+    "what", "where", "who", "whose", "why", "how", "which",
+    "here", "there", "now", "then",
+    "do", "does", "did", "done",
+    "have", "has", "had", "having",
+    "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+    "very", "much", "many", "some", "any", "all",
+    "one", "two", "three",
+}
+
+
+def _get_vocab_tokens() -> set[str]:
+    """Load all meaningful tokens from the user's DB vocabulary."""
+    global _vocab_tokens
+    if _vocab_tokens is not None:
+        return _vocab_tokens
+    try:
+        from services.vector_vocabulary import get_vector_vocabulary
+        v = get_vector_vocabulary("en")
+        if not v._loaded:
+            v.load()
+        all_tokens = v.tokens()
+        _vocab_tokens = {t for t in all_tokens if len(t) > 2 or t not in _EXCLUDED_WORDS}
+        log.info("Loaded %d vocab tokens for highlighting (from %d total)",
+                 len(_vocab_tokens), len(all_tokens))
+    except Exception as e:
+        log.warning("Failed to load vocab for highlighting: %s", e)
+        _vocab_tokens = set()
+    return _vocab_tokens
+
+
+def _highlight_vocab(text: str) -> str:
+    """Mark DB vocabulary words in text with parentheses."""
+    tokens = _get_vocab_tokens()
+    if not tokens:
+        return text
+
+    def _replace(m: re.Match) -> str:
+        t = m.group(0)
+        low = t.lower()
+        if low not in _EXCLUDED_WORDS and low in tokens:
+            return f"({t})"
+        return t
+
+    return _VOCAB_WORD_RE.sub(_replace, text)
+
+
 def _allowed(chat_id: int) -> bool:
     return not ALLOWED_CHAT_IDS or chat_id in ALLOWED_CHAT_IDS
+
 
 async def _action(bot, chat_id: int, kind: ChatAction) -> None:
     try:
@@ -28,19 +89,34 @@ async def _action(bot, chat_id: int, kind: ChatAction) -> None:
     except Exception:
         pass
 
+
+async def _send_voice_and_text(bot, chat_id: int, text: str) -> None:
+    """Send voice message first, then text with vocabulary marked in ()."""
+    # 1. Voice message
+    try:
+        mp3_path = await generate_tts(text)
+        with open(mp3_path, "rb") as fh:
+            await bot.send_voice(chat_id=chat_id, voice=fh)
+    except Exception as e:
+        log.warning("TTS failed: %s", e)
+
+    # 2. Text with vocabulary words marked in ()
+    try:
+        highlighted = _highlight_vocab(text)
+        await bot.send_message(chat_id=chat_id, text=highlighted)
+    except Exception as e:
+        log.warning("Marked text send failed: %s", e)
+        await bot.send_message(chat_id=chat_id, text=text)
+
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not _allowed(chat_id):
         return
     await _action(context.bot, chat_id, ChatAction.RECORD_VOICE)
     text = greet(chat_id)
-    try:
-        mp3_path = await generate_tts(text)
-        with open(mp3_path, "rb") as fh:
-            await context.bot.send_voice(chat_id=chat_id, voice=fh)
-    except Exception as e:
-        log.error("TTS on /start failed: %s", e)
-        await context.bot.send_message(chat_id=chat_id, text=text)
+    await _send_voice_and_text(context.bot, chat_id, text)
+
 
 async def on_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -50,68 +126,78 @@ async def on_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = "Conversation history has been reset!" if had else "No active conversation was found."
     await context.bot.send_message(chat_id=chat_id, text=message)
 
+
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not _allowed(chat_id):
         return
-    
+
     voice = update.message.voice
-    log.info("Voice received: chat_id=%s, duration=%ss, size=%s bytes", chat_id, voice.duration, voice.file_size)
-    
+    log.info("Voice received: chat_id=%s, duration=%ss, size=%s bytes",
+             chat_id, voice.duration, voice.file_size)
+
     temp_dir = Path(os.getenv("TEMP_DIR", "tmp"))
     temp_dir.mkdir(parents=True, exist_ok=True)
-    
+
     work_dir = Path(tempfile.mkdtemp(prefix="bot_voice_", dir=temp_dir))
     incoming_audio = work_dir / "input.ogg"
-    
+
     try:
         await _action(context.bot, chat_id, ChatAction.TYPING)
         tg_file = await context.bot.get_file(voice.file_id)
         await tg_file.download_to_drive(str(incoming_audio))
-        
+
         if incoming_audio.stat().st_size < 100:
-            await context.bot.send_message(chat_id=chat_id, text="The voice message seems empty. Please try again.")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="The voice message seems empty. Please try again.",
+            )
             return
-            
+
         # 1. Transcribe audio
         try:
             user_text = transcribe_audio(incoming_audio)
         except Exception as e:
             log.error("STT failed: %s", e)
-            await context.bot.send_message(chat_id=chat_id, text="Sorry, I couldn't understand the audio. Please try again.")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Sorry, I couldn't understand the audio. Please try again.",
+            )
             return
-            
+
         if not user_text.strip():
-            await context.bot.send_message(chat_id=chat_id, text="I couldn't hear anything. Please try again.")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="I couldn't hear anything. Please try again.",
+            )
             return
-            
+
         log.info("User: %s", user_text)
-        
-        # 2. Get AI Response
+
+        # 2. Get AI Response (returns dict with final_response + selected_vocab)
         await _action(context.bot, chat_id, ChatAction.TYPING)
         try:
-            bot_text = reply(chat_id, user_text)
+            result = reply(chat_id, user_text)
         except Exception as e:
             log.error("Agent reply failed: %s", e)
-            await context.bot.send_message(chat_id=chat_id, text="Sorry, I'm having trouble thinking right now.")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Sorry, I'm having trouble thinking right now.",
+            )
             return
-            
+
+        bot_text = result.get("final_response", "")
+
         if not bot_text.strip():
             await context.bot.send_message(chat_id=chat_id, text="...")
             return
-            
+
         log.info("Bot: %s", bot_text)
-        
-        # 3. Synthesize and Send Voice
+
+        # 3. Send voice + text with vocab highlights
         await _action(context.bot, chat_id, ChatAction.RECORD_VOICE)
-        try:
-            mp3_path = await generate_tts(bot_text)
-            with open(mp3_path, "rb") as fh:
-                await context.bot.send_voice(chat_id=chat_id, voice=fh)
-        except Exception as e:
-            log.error("TTS failed: %s", e)
-            await context.bot.send_message(chat_id=chat_id, text=bot_text)
-            
+        await _send_voice_and_text(context.bot, chat_id, bot_text)
+
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
